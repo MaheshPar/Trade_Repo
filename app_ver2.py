@@ -1,3 +1,5 @@
+# WORKING CODE reads from google sheet ETF give 1d 1m 1w returns, nifty 50 index not included also 50,100,200 EMA 
+
 import streamlit as st
 import pandas as pd
 import yfinance as yf
