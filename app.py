@@ -7,11 +7,11 @@ from streamlit_gsheets import GSheetsConnection
 st.set_page_config(page_title="ETF Returns Screener", layout="wide")
 
 # Add this cleanup block directly ABOVE your `conn = st.connection(...)` line
-if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
-    sa = st.secrets["connections"]["gsheets"].get("service_account", {})
-    if "private_key" in sa and "\\n" in sa["private_key"]:
-        # Dynamically converts raw "\n" text markers into real line breaks before Google sees them
-        st.secrets["connections"]["gsheets"]["service_account"]["private_key"] = sa["private_key"].replace("\\n", "\n")
+#if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+#    sa = st.secrets["connections"]["gsheets"].get("service_account", {})
+#    if "private_key" in sa and "\\n" in sa["private_key"]:
+#        # Dynamically converts raw "\n" text markers into real line breaks before Google sees them
+#        st.secrets["connections"]["gsheets"]["service_account"]["private_key"] = sa["private_key"].replace("\\n", "\n")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
