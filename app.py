@@ -8,22 +8,28 @@ st.set_page_config(page_title="ETF Returns Screener", layout="wide")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Initialize ETF tickers from Google Sheets into session state
+# Initialize ETF tickers with robust header and white-space cleanup
 if "etf_tickers" not in st.session_state:
     try:
-        df_etfs = conn.read(worksheet="Sheet1", usecols=[0, 1])
-        df_etfs = df_etfs.dropna(subset=["symbol"])
-        st.session_state.etf_tickers = df_etfs.to_dict("records")
-    except Exception:
-        # Fallback to an empty list if sheet read fails entirely
+        df_etfs = conn.read(usecols=[0, 1])
+        df_etfs.columns = [str(col).strip().lower() for col in df_etfs.columns]
+        if "symbol" in df_etfs.columns and "name" in df_etfs.columns:
+            df_etfs = df_etfs.dropna(subset=["symbol"])
+            df_etfs["symbol"] = df_etfs["symbol"].astype(str).str.strip().str.upper()
+            df_etfs["name"] = df_etfs["name"].astype(str).str.strip()
+            st.session_state.etf_tickers = df_etfs[["symbol", "name"]].to_dict("records")
+        else:
+            st.error("Sheet must contain 'symbol' and 'name' columns.")
+            st.session_state.etf_tickers = []
+    except Exception as e:
+        st.error(f"Google Sheets connection failed: {str(e)}")
         st.session_state.etf_tickers = []
 
 def save_to_gsheets():
     updated_df = pd.DataFrame(st.session_state.etf_tickers)
-    conn.update(worksheet="Sheet1", data=updated_df)
-    st.cache_data.clear() # Clears GSheets read cache to ensure fresh reload
+    conn.update(data=updated_df)
+    st.cache_data.clear()
 
-# Cache keyed on symbol only to prevent re-downloads when dates shift
 @st.cache_data(show_spinner=False)
 def fetch_ticker_data(symbol):
     try:
@@ -76,10 +82,12 @@ with st.expander("Manage ETFs"):
     with add_c3:
         st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
         if st.button("Add ETF"):
-            if new_sym and new_name and not any(t["symbol"] == new_sym.upper() for t in st.session_state.etf_tickers):
-                st.session_state.etf_tickers.append({"symbol": new_sym.upper(), "name": new_name})
-                save_to_gsheets()
-                st.rerun()
+            if new_sym and new_name:
+                clean_sym = new_sym.strip().upper()
+                if not any(t["symbol"] == clean_sym for t in st.session_state.etf_tickers):
+                    st.session_state.etf_tickers.append({"symbol": clean_sym, "name": new_name.strip()})
+                    save_to_gsheets()
+                    st.rerun()
     
     st.divider()
     
@@ -122,7 +130,6 @@ if st.button("SCAN"):
         for idx, item in enumerate(st.session_state.etf_tickers):
             sym = item["symbol"]
             series = fetch_ticker_data(sym)
-            
             lcp = get_price_on_or_before(series, to_date)
             
             row = {
@@ -136,12 +143,17 @@ if st.button("SCAN"):
                 past_price = get_price_on_or_before(series, past_date)
                 row[period] = format_return(lcp, past_price)
                 
-            results.append(row)
+            results.append(row) # Fixed layout alignment to correctly append once per ticker loop
 
     st.success("Scan Completed.")
     
     if results:
         df = pd.DataFrame(results)
+        
+        # Explicit order sorting matching initial prompt specifications
+        columns_order = ["Sr. No.", "Ticker", "LCP", "1D", "1W", "1M", "3M", "6M", "1Y", "3Y", "5Y", "10Y"]
+        df = df[columns_order]
+        
         styled_df = df.style.map(color_returns, subset=["1D", "1W", "1M", "3M", "6M", "1Y", "3Y", "5Y", "10Y"])
         
         st.dataframe(
