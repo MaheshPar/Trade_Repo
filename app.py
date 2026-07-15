@@ -417,14 +417,21 @@ with tab3:
                         "Nifty 50 1M": f"{nifty_1m_pct:+.2f}%" if nifty_1m_pct != 0 else "0.00%"
                     }
 
-                    for sym in backtest_symbols:
-                        clean_sym = sym.replace(".NS", "")
-                        raw_ret = m_returns[sym]
-                        if raw_ret == -999.0:
-                            row_data[f"{clean_sym} 1M"] = "N/A"
+                    # ONLY calculate returns for the selected top ranked symbols
+                    for i in range(top_n_val):
+                        suffix = "st" if i == 0 else "nd" if i == 1 else "rd" if i == 2 else "th"
+                        col_name = f"{i+1}{suffix} Return"
+                        
+                        if i < len(top_selected):
+                            target_sym = top_selected[i]
+                            raw_ret = m_returns[target_sym]
+                            if raw_ret == -999.0:
+                                row_data[col_name] = "N/A"
+                            else:
+                                pct_val = raw_ret * 100
+                                row_data[col_name] = f"{pct_val:+.2f}%" if pct_val != 0 else "0.00%"
                         else:
-                            pct_val = raw_ret * 100
-                            row_data[f"{clean_sym} 1M"] = f"{pct_val:+.2f}%" if pct_val != 0 else "0.00%"
+                            row_data[col_name] = "N/A"
 
                     bt_history.append(row_data)
 
@@ -448,14 +455,15 @@ with tab3:
                     
                     t += rebal_step
 
-                # Append final terminating values for continuous data visual curve rendering
+                # Append final terminating values for data frame completion
+                rank_cols_labels = [f"{i+1}{'st' if i==0 else 'nd' if i==1 else 'rd' if i==2 else 'th'} Return" for i in range(top_n_val)]
                 bt_history.append({
                     "Date": d_next,
                     f"Top-{top_n_val} Momentum": portfolio_val,
                     "Nifty 50 Benchmark": nifty_val,
                     "Allocated Holdings": "End of Backtest",
                     "Nifty 50 1M": "N/A",
-                    **{f"{sym.replace('.NS', '')} 1M": "N/A" for sym in backtest_symbols}
+                    **{lbl: "N/A" for lbl in rank_cols_labels}
                 })
 
                 df_bt = pd.DataFrame(bt_history)
@@ -479,19 +487,17 @@ with tab3:
                 st.line_chart(chart_df, height=450)
 
                 st.markdown("### 🗓️ Rebalance Decisions Log")
-                # Exclude boundary initialization/termination nodes from log visualization matrix
                 log_df = df_bt[df_bt["Allocated Holdings"] != "End of Backtest"].copy()
                 log_df["Date"] = log_df["Date"].dt.strftime('%d %B %Y')
                 
-                clean_sym_cols = [sym.replace(".NS", "") for sym in backtest_symbols]
-                log_cols_order = ["Date", "Allocated Holdings", f"Top-{top_n_val} Momentum", "Nifty 50 Benchmark", "Nifty 50 1M"] + [f"{c} 1M" for c in clean_sym_cols]
+                log_cols_order = ["Date", "Allocated Holdings", f"Top-{top_n_val} Momentum", "Nifty 50 Benchmark", "Nifty 50 1M"] + rank_cols_labels
                 log_df = log_df[log_cols_order]
 
                 st.dataframe(
                     log_df.style.format({
                         f"Top-{top_n_val} Momentum": "{:.2f}",
                         "Nifty 50 Benchmark": "{:.2f}"
-                    }).map(color_returns, subset=["Nifty 50 1M"] + [f"{c} 1M" for c in clean_sym_cols]),
+                    }).map(color_returns, subset=["Nifty 50 1M"] + rank_cols_labels),
                     use_container_width=True,
                     hide_index=True
                 )
