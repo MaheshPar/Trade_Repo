@@ -1,0 +1,470 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+from datetime import date
+from streamlit_gsheets import GSheetsConnection
+
+st.set_page_config(page_title="ETF Returns Screener", layout="wide")
+
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+# Initialize ETF tickers with robust header cleanup and default Nifty 50 Injection
+if "etf_tickers" not in st.session_state:
+    try:
+        df_etfs = conn.read(usecols=[0, 1])
+        df_etfs.columns = [str(col).strip().lower() for col in df_etfs.columns]
+        
+        if "symbol" in df_etfs.columns and "name" in df_etfs.columns:
+            df_etfs = df_etfs.dropna(subset=["symbol"])
+            df_etfs["symbol"] = df_etfs["symbol"].astype(str).str.strip().str.upper()
+            df_etfs["name"] = df_etfs["name"].astype(str).str.strip()
+            
+            # Filter out ^NSEI from the incoming list to prevent any duplicate bugs
+            user_list = [t for t in df_etfs[["symbol", "name"]].to_dict("records") if t["symbol"] != "^NSEI"]
+            
+            # Inject Nifty 50 Index firmly at index 0
+            st.session_state.etf_tickers = [{"symbol": "^NSEI", "name": "Nifty 50 Index"}] + user_list
+        else:
+            st.error("Sheet must contain 'symbol' and 'name' columns.")
+            st.session_state.etf_tickers = [{"symbol": "^NSEI", "name": "Nifty 50 Index"}]
+    except Exception as e:
+        st.error(f"Google Sheets connection failed: {str(e)}")
+        st.session_state.etf_tickers = [{"symbol": "^NSEI", "name": "Nifty 50 Index"}]
+
+def save_to_gsheets():
+    # Keep Google Sheet database clean by filtering out the default embedded index
+    user_tickers = [t for t in st.session_state.etf_tickers if t["symbol"] != "^NSEI"]
+    updated_df = pd.DataFrame(user_tickers)
+    conn.update(data=updated_df)
+    st.cache_data.clear()
+
+@st.cache_data(show_spinner=False)
+def fetch_ticker_data(symbol):
+    try:
+        hist = yf.Ticker(symbol).history(period="15y")
+        if hist.empty:
+            return None
+        hist.index = hist.index.tz_localize(None)
+        return hist['Close']
+    except Exception:
+        return None
+
+# Dedicated backtest data fetcher with wider parameters
+@st.cache_data(show_spinner=False)
+def fetch_backtest_data(symbols, start, end):
+    data = {}
+    for sym in symbols + ["^NSEI"]:
+        try:
+            hist = yf.Ticker(sym).history(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"))
+            if not hist.empty:
+                hist.index = hist.index.tz_localize(None)
+                data[sym] = hist['Close']
+        except Exception:
+            pass
+    return pd.DataFrame(data)
+
+def get_price_on_or_before(series, target_date):
+    if series is None or series.empty:
+        return None
+    target_dt = pd.to_datetime(target_date)
+    valid_dates = series.index[series.index <= target_dt]
+    if valid_dates.empty:
+        return None
+    return float(series.loc[valid_dates.max()])
+
+def get_ema_on_or_before(series, span, target_date):
+    if series is None or series.empty or len(series) < span:
+        return None
+    ema_series = series.ewm(span=span, adjust=False).mean()
+    return get_price_on_or_before(ema_series, target_date)
+
+def format_return(current_price, past_price):
+    if current_price is None or past_price is None or past_price == 0:
+        return "N/A"
+    ret = ((current_price - past_price) / past_price) * 100
+    return f"+{ret:.2f}%" if ret > 0 else f"{ret:.2f}%"
+
+def color_returns(val):
+    if not isinstance(val, str):
+        return ""
+    if val.startswith("+"):
+        return "color: green;"
+    elif val.startswith("-"):
+        return "color: red;"
+    return ""
+
+st.title("ETF Returns Screener")
+
+col1, col2, col3 = st.columns([1, 1, 2])
+with col1:
+    from_date = st.date_input("From Date", value=pd.to_datetime("today").date() - pd.DateOffset(years=10))
+with col2:
+    to_date = st.date_input("To Date", value=pd.to_datetime("today").date())
+
+with st.expander("Manage ETFs"):
+    add_c1, add_c2, add_c3 = st.columns([2, 3, 1])
+    with add_c1:
+        new_sym = st.text_input("New Symbol (e.g., INFRABEES.NS)")
+    with add_c2:
+        new_name = st.text_input("New ETF Name")
+    with add_c3:
+        st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+        if st.button("Add ETF"):
+            if new_sym and new_name:
+                clean_sym = new_sym.strip().upper()
+                if not any(t["symbol"] == clean_sym for t in st.session_state.etf_tickers):
+                    st.session_state.etf_tickers.append({"symbol": clean_sym, "name": new_name.strip()})
+                    save_to_gsheets()
+                    st.rerun()
+    
+    st.divider()
+    
+    rem_options = [t["symbol"] for t in st.session_state.etf_tickers if t["symbol"] != "^NSEI"]
+    if rem_options:
+        rem_c1, rem_c2 = st.columns([4, 1])
+        with rem_c1:
+            rem_sym = st.selectbox("Select ETF to Remove", options=rem_options)
+        with rem_c2:
+            st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("Remove ETF") and rem_sym:
+                st.session_state.etf_tickers = [t for t in st.session_state.etf_tickers if t["symbol"] != rem_sym]
+                save_to_gsheets()
+                st.rerun()
+    else:
+        st.info("No custom tickers found. Add your specific ETFs above.")
+
+# Global variables for state recovery
+scanned_data = st.session_state.get("scan_results", [])
+nifty_regime_bullish = st.session_state.get("nifty_regime", False)
+
+if st.button("SCAN"):
+    if to_date < from_date:
+        st.error("Error: 'To Date' cannot be before 'From Date'.")
+        st.stop()
+    if to_date > date.today():
+        st.error("Error: 'To Date' cannot be in the future.")
+        st.stop()
+    
+    offsets = {
+        "1D": pd.DateOffset(days=1),
+        "1W": pd.DateOffset(days=7),
+        "1M": pd.DateOffset(months=1),
+        "3M": pd.DateOffset(months=3),
+        "6M": pd.DateOffset(months=6),
+        "1Y": pd.DateOffset(years=1),
+        "3Y": pd.DateOffset(years=3),
+        "5Y": pd.DateOffset(years=5),
+        "10Y": pd.DateOffset(years=10),
+    }
+
+    with st.spinner("Scanning markets..."):
+        nifty_series = fetch_ticker_data("^NSEI")
+        n_lcp = get_price_on_or_before(nifty_series, to_date)
+        n_ema100 = get_ema_on_or_before(nifty_series, 100, to_date)
+        nifty_regime_bullish = (n_lcp > n_ema100) if (n_lcp is not None and n_ema100 is not None) else False
+
+        results = []
+        for idx, item in enumerate(st.session_state.etf_tickers):
+            sym = item["symbol"]
+            series = nifty_series if sym == "^NSEI" else fetch_ticker_data(sym)
+            
+            lcp = get_price_on_or_before(series, to_date)
+            ema50 = get_ema_on_or_before(series, 50, to_date)
+            ema100 = get_ema_on_or_before(series, 100, to_date)
+            ema200 = get_ema_on_or_before(series, 200, to_date)
+            
+            c1 = (lcp > ema100) if (lcp is not None and ema100 is not None) else False
+            c2 = (ema50 > ema100) if (ema50 is not None and ema100 is not None) else False
+            c3 = (ema100 > ema200) if (ema100 is not None and ema200 is not None) else False
+            c4 = nifty_regime_bullish
+            
+            is_screened = c1 and c2 and c3 and c4
+            
+            row = {
+                "Sr. No.": idx + 1,
+                "Ticker": sym,
+                "LCP": f"{lcp:.2f}" if lcp is not None else "N/A",
+                "50 EMA": f"{ema50:.2f}" if ema50 is not None else "N/A",
+                "100 EMA": f"{ema100:.2f}" if ema100 is not None else "N/A",
+                "200 EMA": f"{ema200:.2f}" if ema200 is not None else "N/A",
+                "_is_screened": is_screened
+            }
+            
+            for period, offset in offsets.items():
+                past_date = pd.to_datetime(to_date) - offset
+                past_price = get_price_on_or_before(series, past_date)
+                row[period] = format_return(lcp, past_price)
+                
+            results.append(row)
+        
+        st.session_state.scan_results = results
+        st.session_state.nifty_regime = nifty_regime_bullish
+        scanned_data = results
+        st.success("Scan Completed.")
+
+# Render tab layout
+tab1, tab2, tab3 = st.tabs(["📋 All ETFs", "🎯 Screened ETFs (Bullish Trend)", "📈 Backtest Strategy"])
+
+# TAB 1: ALL TICKERS
+with tab1:
+    if scanned_data:
+        df = pd.DataFrame(scanned_data)
+        columns_order = [
+            "Sr. No.", "Ticker", "LCP", "50 EMA", "100 EMA", "200 EMA", 
+            "1D", "1W", "1M", "3M", "6M", "1Y", "3Y", "5Y", "10Y"
+        ]
+        df_display = df[columns_order]
+        styled_df = df_display.style.map(color_returns, subset=["1D", "1W", "1M", "3M", "6M", "1Y", "3Y", "5Y", "10Y"])
+        
+        st.dataframe(
+            styled_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Sr. No.": st.column_config.NumberColumn("Sr. No.", width="small"),
+                "Ticker": st.column_config.TextColumn("Ticker", width="medium"),
+            }
+        )
+        
+        csv = df_display.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Complete Results as CSV",
+            data=csv,
+            file_name="etf_returns.csv",
+            mime="text/csv",
+            key="dl_all"
+        )
+    else:
+        st.info("Click the 'SCAN' button above to pull current market parameters.")
+
+# TAB 2: CRITERIA SCREENER
+with tab2:
+    if scanned_data:
+        st.markdown("### 🚦 Screener Status")
+        col_a, col_b, col_c, col_d = st.columns(4)
+        with col_a:
+            st.metric("1. Close > 100 EMA", "Active")
+        with col_b:
+            st.metric("2. 50 EMA > 100 EMA", "Active")
+        with col_c:
+            st.metric("3. 100 EMA > 200 EMA", "Active")
+        with col_d:
+            st.metric("4. Nifty 50 > 100 EMA", "🟢 Bullish" if nifty_regime_bullish else "🔴 Bearish")
+        
+        st.divider()
+
+        if not nifty_regime_bullish:
+            st.warning("⚠️ **Market Shield Active:** Nifty 50 is trading below its 100 EMA. Long setups are temporarily blocked to protect trading capital.")
+        else:
+            df = pd.DataFrame(scanned_data)
+            df_filtered = df[(df["_is_screened"] == True) & (df["Ticker"] != "^NSEI")].copy()
+            
+            if not df_filtered.empty:
+                df_filtered["Sr. No."] = range(1, len(df_filtered) + 1)
+                columns_order = [
+                    "Sr. No.", "Ticker", "LCP", "50 EMA", "100 EMA", "200 EMA", 
+                    "1D", "1W", "1M", "3M", "6M", "1Y", "3Y", "5Y", "10Y"
+                ]
+                df_filtered_display = df_filtered[columns_order]
+                styled_filtered = df_filtered_display.style.map(color_returns, subset=["1D", "1W", "1M", "3M", "6M", "1Y", "3Y", "5Y", "10Y"])
+                
+                st.dataframe(
+                    styled_filtered,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Sr. No.": st.column_config.NumberColumn("Sr. No.", width="small"),
+                        "Ticker": st.column_config.TextColumn("Ticker", width="medium"),
+                    }
+                )
+            else:
+                st.info("No ETFs currently meet all 4 Bullish Trend criteria.")
+    else:
+        st.info("Click the 'SCAN' button above to check screening rules.")
+
+# TAB 3: BACKTEST STRATEGY
+with tab3:
+    st.markdown("### 📊 Portfolio Backtester (Last 5 Years)")
+    
+    backtest_symbols = [
+        "MID150BEES.NS", "GOLDBEES.NS", "CPSEETF.NS", "HNGSNGBEES.NS",
+        "ITBEES.NS", "NIFTYBEES.NS", "NV20IETF.NS", "BANKBEES.NS",
+        "PHARMABEES.NS", "JUNIORBEES.NS"
+    ]
+
+    # Configuration Controls
+    ctrl_col1, ctrl_col2 = st.columns(2)
+    with ctrl_col1:
+        rebal_choice = st.selectbox(
+            "Rebalancing Frequency", 
+            options=["1 Month", "3 Month", "6 Month"], 
+            index=0
+        )
+    with ctrl_col2:
+        top_choice = st.selectbox(
+            "Allocation Selection Size", 
+            options=["Top 3", "Top 5"], 
+            index=1
+        )
+
+    # Map interactive choices to logical program variables
+    rebal_months_map = {"1 Month": 1, "3 Month": 3, "6 Month": 6}
+    top_n_map = {"Top 3": 3, "Top 5": 5}
+    
+    rebal_step = rebal_months_map[rebal_choice]
+    top_n_val = top_n_map[top_choice]
+
+    st.markdown(f"""
+    **Current Backtest Rules:**
+    * **Target Universe**: 10 Core ETFs (MID150BEES, GOLDBEES, CPSEETF, HNGSNGBEES, ITBEES, NIFTYBEES, NV20IETF, BANKBEES, PHARMABEES, JUNIORBEES).
+    * **Holding Period**: Rebalancing executed once every **{rebal_choice}** (at the start of the week/month).
+    * **Ranking Rule**: Invests in **{top_choice}** highest-performing ETFs based on their trailing 1-month return.
+    """)
+
+    if st.button("RUN BACKTEST"):
+        with st.spinner("Processing historical pricing databases..."):
+            end_bt = pd.to_datetime("today")
+            # Pull 5 years + extra buffer to calculate first lookback return
+            start_bt = end_bt - pd.DateOffset(years=5, months=2)
+
+            df_prices = fetch_backtest_data(backtest_symbols, start_bt, end_bt)
+
+            if df_prices.empty or len(df_prices.columns) < 2:
+                st.error("Failed to fetch historical market data for backtesting.")
+            else:
+                df_prices = df_prices.ffill().bfill()
+                
+                # Retrieve first trading day coordinates of each calendar month
+                monthly_dates = df_prices.groupby([df_prices.index.year, df_prices.index.month]).apply(lambda x: x.index.min())
+                monthly_dates = sorted(pd.to_datetime(monthly_dates.values))
+
+                # Identify official asset launch dates to protect newer tickers from backfill errors
+                launch_dates = {sym: df_prices[sym].first_valid_index() for sym in df_prices.columns}
+
+                portfolio_val = 100.0
+                nifty_val = 100.0
+                eq_weight_val = 100.0
+
+                bt_history = []
+                
+                # Append initial base value index (rebalance starting point)
+                first_inv_date = monthly_dates[1]
+                bt_history.append({
+                    "Date": first_inv_date,
+                    f"Top-{top_n_val} Momentum": portfolio_val,
+                    "Nifty 50 Benchmark": nifty_val,
+                    "Equal-Weight Portfolio": eq_weight_val,
+                    "Allocated Holdings": "Initial State"
+                })
+
+                # Compute periodic rebalances using step parameter
+                t = 1
+                while t < len(monthly_dates) - rebal_step:
+                    d_prev = monthly_dates[t-1]
+                    d_curr = monthly_dates[t]
+                    d_next = monthly_dates[t + rebal_step]
+
+                    # 1. Calculate trailing 1-month returns for momentum ranking at this rebalance date
+                    m_returns = {}
+                    for sym in backtest_symbols:
+                        if sym in df_prices.columns and d_prev >= launch_dates.get(sym, d_prev):
+                            p_prev = df_prices.loc[d_prev, sym]
+                            p_curr = df_prices.loc[d_curr, sym]
+                            if pd.notna(p_prev) and p_prev > 0:
+                                m_returns[sym] = (p_curr - p_prev) / p_prev
+                            else:
+                                m_returns[sym] = -999.0
+                        else:
+                            m_returns[sym] = -999.0
+
+                    # 2. Rank assets and select Top-N selection
+                    sorted_m = sorted(m_returns.items(), key=lambda x: x[1], reverse=True)
+                    top_selected = [item[0] for item in sorted_m[:top_n_val] if item[1] != -999.0]
+
+                    if not top_selected:
+                        top_selected = backtest_symbols[:top_n_val]
+
+                    # 3. Calculate compound holdings returns over the entire holding step interval
+                    # A. Momentum Strategy Performance
+                    p_ret_sum = 0.0
+                    v_count = 0
+                    for sym in top_selected:
+                        p_curr = df_prices.loc[d_curr, sym]
+                        p_next = df_prices.loc[d_next, sym]
+                        if pd.notna(p_curr) and p_curr > 0:
+                            p_ret_sum += (p_next - p_curr) / p_curr
+                            v_count += 1
+                    strat_return = (p_ret_sum / v_count) if v_count > 0 else 0.0
+
+                    # B. Equal-Weight Performance (Buy and Hold Universe Comparison)
+                    ew_ret_sum = 0.0
+                    ew_count = 0
+                    for sym in backtest_symbols:
+                        if sym in df_prices.columns and d_curr >= launch_dates.get(sym, d_curr):
+                            p_curr = df_prices.loc[d_curr, sym]
+                            p_next = df_prices.loc[d_next, sym]
+                            if pd.notna(p_curr) and p_curr > 0:
+                                ew_ret_sum += (p_next - p_curr) / p_curr
+                                ew_count += 1
+                    ew_return = (ew_ret_sum / ew_count) if ew_count > 0 else 0.0
+
+                    # C. Nifty 50 Performance
+                    n_curr = df_prices.loc[d_curr, "^NSEI"] if "^NSEI" in df_prices.columns else None
+                    n_next = df_prices.loc[d_next, "^NSEI"] if "^NSEI" in df_prices.columns else None
+                    nifty_return = (n_next - n_curr) / n_curr if (pd.notna(n_curr) and pd.notna(n_next) and n_curr > 0) else 0.0
+
+                    # Update cumulative compound index curves
+                    portfolio_val *= (1 + strat_return)
+                    nifty_val *= (1 + nifty_return)
+                    eq_weight_val *= (1 + ew_return)
+
+                    bt_history.append({
+                        "Date": d_next,
+                        f"Top-{top_n_val} Momentum": portfolio_val,
+                        "Nifty 50 Benchmark": nifty_val,
+                        "Equal-Weight Portfolio": eq_weight_val,
+                        "Allocated Holdings": ", ".join([s.replace(".NS", "") for s in top_selected])
+                    })
+                    
+                    t += rebal_step
+
+                df_bt = pd.DataFrame(bt_history)
+                df_bt["Date"] = pd.to_datetime(df_bt["Date"])
+                
+                # Performance Summary Calculation
+                years_dur = (df_bt["Date"].max() - df_bt["Date"].min()).days / 365.25
+                cagr_strat = (df_bt[f"Top-{top_n_val} Momentum"].iloc[-1] / 100.0) ** (1 / years_dur) - 1 if years_dur > 0 else 0
+                cagr_nifty = (df_bt["Nifty 50 Benchmark"].iloc[-1] / 100.0) ** (1 / years_dur) - 1 if years_dur > 0 else 0
+                cagr_ew = (df_bt["Equal-Weight Portfolio"].iloc[-1] / 100.0) ** (1 / years_dur) - 1 if years_dur > 0 else 0
+
+                st.markdown("### 🏆 Performance Summary (CAGR)")
+                m_col1, m_col2, m_col3 = st.columns(3)
+                with m_col1:
+                    st.metric(f"Top-{top_n_val} Momentum CAGR", f"{cagr_strat*100:.2f}%", f"vs Nifty: {(cagr_strat-cagr_nifty)*100:+.2f}%")
+                with m_col2:
+                    st.metric("Equal-Weight CAGR", f"{cagr_ew*100:.2f}%")
+                with m_col3:
+                    st.metric("Nifty 50 Index CAGR", f"{cagr_nifty*100:.2f}%")
+
+                st.divider()
+
+                # Visualizing Equity Curves
+                st.markdown("### 📈 Cumulative Equity Growth (Base value: 100)")
+                chart_df = df_bt.set_index("Date")[[f"Top-{top_n_val} Momentum", "Nifty 50 Benchmark", "Equal-Weight Portfolio"]]
+                st.line_chart(chart_df, height=450)
+
+                # Rebalance Decisions Log
+                st.markdown("### 🗓️ Rebalance Decisions Log")
+                log_df = df_bt.copy()
+                log_df["Date"] = log_df["Date"].dt.strftime('%d %B %Y')
+                log_df = log_df[["Date", "Allocated Holdings", f"Top-{top_n_val} Momentum", "Equal-Weight Portfolio", "Nifty 50 Benchmark"]]
+                
+                st.dataframe(
+                    log_df.style.format({
+                        f"Top-{top_n_val} Momentum": "{:.2f}",
+                        "Equal-Weight Portfolio": "{:.2f}",
+                        "Nifty 50 Benchmark": "{:.2f}"
+                    }),
+                    use_container_width=True,
+                    hide_index=True
+                )
